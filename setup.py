@@ -2,7 +2,6 @@ import boto3
 import os
 from string import Template
 
-
 '''
 MANUAL STEPS
     - Setup a wildcard certificate for *.company.co.in in AWS Certificate Manager and get the certificate arn.
@@ -72,6 +71,20 @@ elb_client = boto3.client('elb')
 iam_client = boto3.client('iam')
 
 
+def get_iam_policy_arn():
+    response = iam_client.list_policies(
+        Scope='Local'
+    )
+    for policy in response['Policies']:
+        if policy['PolicyName'] == IAM_POLICY_NAME:
+            return policy['Arn']
+
+
+def get_instance_profile_arn():
+    response = iam_client.get_instance_profile(InstanceProfileName=INSTANCE_PROFILE_NAME)
+    return response['InstanceProfile']['Arn']
+
+
 def create_policy():
     return iam_client.create_policy(
         PolicyName=IAM_POLICY_NAME,
@@ -113,7 +126,6 @@ def create_vpc():
         CidrBlock=VPC_CIDR,
     )
 
-    print (vpc)
     client.create_tags(
         Resources=[
             vpc['Vpc']['VpcId'],
@@ -164,13 +176,12 @@ def create_subnet(vpc):
             },
         ]
     )
-    response = client.modify_subnet_attribute(
+    client.modify_subnet_attribute(
         MapPublicIpOnLaunch={
             'Value': True
         },
         SubnetId=subnet.subnet_id
     )
-    print (response)
     return subnet
 
 
@@ -221,6 +232,7 @@ def create_nodes(subnet, security_group, NODES_STORAGE_SIZE, NODES_AMI, NODES_IN
             security_group.group_id,
         ],
         SubnetId=subnet.subnet_id,
+        # TODO: Attach Instance Profile ARN later as it is not created immediately
         # IamInstanceProfile={
         #     "Name": IAM_ROLE_NAME
         # }
@@ -299,15 +311,11 @@ def create_elb(subnet, security_group):
                     instances_list.append({'InstanceId': id})
             except Exception as e:
                 print (e)
-            print (instance['InstanceId'])
 
-    print (instances_list)
-    response = elb_client.register_instances_with_load_balancer(
+    elb_client.register_instances_with_load_balancer(
         LoadBalancerName=ELB_NAME,
-        # Instances=[{'InstanceID': APP_NODES_NAME + '-' + str(i + 1)} for i in range(0, APP_NODES_COUNT)]
         Instances=instances_list
     )
-    print (response)
     return elb
 
 
@@ -409,7 +417,6 @@ def delete_nodes(NODES_NAME, NODES_COUNT):
             id = instance['InstanceId']
             try:
                 if instance['State']['Name'] != 'terminated':
-                    print (id)
                     client.modify_instance_attribute(InstanceId=id, DisableApiTermination={'Value': False})
                     client.terminate_instances(InstanceIds=[id])
             except Exception as e:
@@ -417,10 +424,13 @@ def delete_nodes(NODES_NAME, NODES_COUNT):
 
 
 def delete_s3_buckets():
-    for bucket_name in S3_BUCKETS:
-        bucket = boto3.resource('s3').Bucket(bucket_name)
-        bucket.objects.all().delete()
-        bucket.delete()
+    try:
+        for bucket_name in S3_BUCKETS:
+            bucket = boto3.resource('s3').Bucket(bucket_name)
+            bucket.objects.all().delete()
+            bucket.delete()
+    except Exception as e:
+        print (e)
 
 
 def delete_vpc_peering_connection():
@@ -435,10 +445,13 @@ def delete_elb():
 
 
 def delete_internet_gateway():
-    vpc_id = get_vpc_id()
-    ig_id = get_vpc_internet_gateway_id()
-    client.detach_internet_gateway(InternetGatewayId=ig_id, VpcId=vpc_id)
-    client.delete_internet_gateway(InternetGatewayId=ig_id)
+    try:
+        vpc_id = get_vpc_id()
+        ig_id = get_vpc_internet_gateway_id()
+        client.detach_internet_gateway(InternetGatewayId=ig_id, VpcId=vpc_id)
+        client.delete_internet_gateway(InternetGatewayId=ig_id)
+    except Exception as e:
+        print (e)
 
 
 def delete_vpc():
@@ -452,15 +465,35 @@ def delete_key_pair():
 
 
 def delete_role_policy():
-    iam_client.delete_role_policy(RoleName=IAM_ROLE_NAME, PolicyName=IAM_POLICY_NAME)
+    try:
+        iam_client.delete_policy(PolicyArn=get_iam_policy_arn())
+    except Exception as e:
+        print (e)
 
 
 def delete_role():
-    iam_client.delete_role(RoleName=IAM_ROLE_NAME)
+    try:
+        iam_client.detach_role_policy(
+            RoleName=IAM_ROLE_NAME,
+            PolicyArn=get_iam_policy_arn()
+        )
+        iam_client.delete_role(RoleName=IAM_ROLE_NAME)
+    except Exception as e:
+        print (e)
 
 
 def delete_instance_profile():
-    iam_client.delete_instance_profile(InstanceProfileName=INSTANCE_PROFILE_NAME)
+    try:
+        iam_client.remove_role_from_instance_profile(
+            InstanceProfileName=INSTANCE_PROFILE_NAME,
+            RoleName=IAM_ROLE_NAME
+        )
+    except Exception as e:
+        print (e)
+    try:
+        iam_client.delete_instance_profile(InstanceProfileName=INSTANCE_PROFILE_NAME)
+    except Exception as e:
+        print (e)
 
 
 def instantiate():
@@ -472,18 +505,17 @@ def instantiate():
     internet_gateway = create_internet_gateway()
     attach_internet_gateway(vpc, internet_gateway)
     add_rules_to_security_group(security_group)
-    # TODO: Add IAM Role to Instances
-    # create_role()
-    # create_instance_profile()
-    # add_role_to_instance_profile()
+    create_role()
+    create_instance_profile()
+    add_role_to_instance_profile()
     create_nodes(subnet, security_group, APP_NODES_STORAGE_SIZE, APP_NODES_AMI, APP_NODES_INSTANCE_TYPE, APP_NODES_COUNT, APP_NODES_NAME)
     create_nodes(subnet, security_group, CACHE_NODES_STORAGE_SIZE, CACHE_NODES_AMI, CACHE_NODES_INSTANCE_TYPE, CACHE_NODES_COUNT, CACHE_NODES_NAME)
     create_nodes(subnet, security_group, CONSUL_NODES_STORAGE_SIZE, CONSUL_NODES_AMI, CONSUL_NODES_INSTANCE_TYPE, CONSUL_NODES_COUNT, CONSUL_NODES_NAME)
     create_nodes(subnet, security_group, DB_NODES_STORAGE_SIZE, DB_NODES_AMI, DB_NODES_INSTANCE_TYPE, DB_NODES_COUNT, DB_NODES_NAME)
     create_vpc_peering_connection(vpc_id)
+    create_route_table_entry()
     create_elb(subnet, security_group)
     create_s3_buckets()
-    create_route_table_entry()
 
 
 def tear_down():
@@ -492,16 +524,15 @@ def tear_down():
     delete_nodes(CACHE_NODES_NAME, CACHE_NODES_COUNT)
     delete_nodes(CONSUL_NODES_NAME, CONSUL_NODES_COUNT)
     delete_nodes(DB_NODES_NAME, DB_NODES_COUNT)
-    # delete_instance_profile()
+    delete_instance_profile()
+    delete_role()
+    delete_role_policy()
     delete_elb()
     delete_subnet()
     delete_security_group()
     delete_internet_gateway()
     delete_vpc_peering_connection()
     delete_vpc()
-    # TODO: Delete role and policy
-    # delete_role_policy()
-    # delete_role()
     delete_s3_buckets()
 
 
